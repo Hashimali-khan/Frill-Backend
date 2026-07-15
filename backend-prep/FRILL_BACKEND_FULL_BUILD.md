@@ -15,6 +15,19 @@ python3.12 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
+**`.gitignore`** *(FIX m5 — was missing entirely)*
+```gitignore
+.venv/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+alembic/versions/*.pyc
+```
+
 **`pyproject.toml`**
 ```toml
 [project]
@@ -27,11 +40,14 @@ dependencies = [
     "asyncpg>=0.29.0",
     "alembic>=1.13.0",
     "pydantic-settings>=2.5.0",
+    "pydantic[email]>=2.0.0",
     "supabase>=2.31.0",
     "pyjwt>=2.9.0",
     "slowapi>=0.1.9",
     "redis>=5.0.0",
     "python-multipart>=0.0.9",
+    "stripe>=7.0.0",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]
@@ -56,6 +72,8 @@ SUPABASE_SERVICE_ROLE_KEY=xxxx
 SUPABASE_JWT_SECRET=xxxx
 REDIS_URL=redis://default:xxxx@xxxx.upstash.io:6379
 CORS_ORIGINS=http://localhost:5173
+STRIPE_SECRET_KEY=sk_test_xxxx
+STRIPE_ENABLED=false
 ```
 
 > Use the **pooler** connection string (port 6543, "Transaction" mode),
@@ -90,6 +108,8 @@ class Settings(BaseSettings):
     supabase_jwt_secret: str
     redis_url: str
     cors_origins: str = "http://localhost:5173"
+    stripe_secret_key: str = ""
+    stripe_enabled: bool = False           # FIX C6 — Stripe feature flag
 
     @property
     def cors_origins_list(self) -> list[str]:
@@ -266,6 +286,9 @@ async def cache_set(key: str, value: Any, ttl_seconds: int = 60) -> None:
 
 
 async def cache_delete_prefix(prefix: str) -> None:
+    # NOTE (m4): SCAN is O(N) on keyspace. Acceptable for MVP traffic
+    # volumes but consider Redis key-space notifications or explicit
+    # key tracking if you scale past ~10k cached keys.
     async for key in redis_client.scan_iter(match=f"{prefix}*"):
         await redis_client.delete(key)
 ```
@@ -325,8 +348,8 @@ def set_csrf_cookie(response: Response) -> str:
 
 
 def verify_csrf(request: Request) -> None:
-    """Double-submit cookie check. Call this as a dependency on every
-    state-changing route once you wire it in (see note at end of doc)."""
+    """Double-submit cookie check. Applied globally via middleware (see main.py).
+    FIX C4 — was defined but never wired in the original plan."""
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return
     cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
@@ -399,8 +422,15 @@ async def get_current_user_optional(
 
 
 async def get_current_admin(user: Profile = Depends(get_current_user)) -> Profile:
-    if user.role != "admin":
+    if user.role not in ("admin", "super_admin"):    # FIX: support super_admin role per Q3 answer
         raise ForbiddenError("Admin access required")
+    return user
+
+
+async def get_current_super_admin(user: Profile = Depends(get_current_user)) -> Profile:
+    """Only super_admin can manage other admin accounts (per Q3 answer)."""
+    if user.role != "super_admin":
+        raise ForbiddenError("Super admin access required")
     return user
 
 
@@ -467,6 +497,37 @@ class UserResponse(BaseModel):
     role: str
 
     model_config = {"from_attributes": True}
+
+
+# FIX M6 — Profile update schema (was missing entirely)
+class ProfileUpdateRequest(BaseModel):
+    first_name: str | None = None
+    last_name: str | None = None
+    phone: str | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def valid_pk_phone_optional(cls, v: str | None) -> str | None:
+        if v is not None and not PK_PHONE_RE.match(v):
+            raise ValueError("Enter a valid Pakistani phone number")
+        return v
+
+
+# FIX C3 — Forgot/reset password schemas (were missing entirely)
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    access_token: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def min_len_8(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
 ```
 
 **`app/services/auth_service.py`**
@@ -476,9 +537,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from supabase import Client, create_client
 
 from app.config import settings
-from app.core.exceptions import ConflictError, InvalidTokenError
+from app.core.exceptions import ConflictError, InvalidTokenError, ValidationAppError
 from app.models.profile import Profile
-from app.schemas.auth import SignupRequest
+from app.schemas.auth import ProfileUpdateRequest, SignupRequest
 
 _supabase: Client = create_client(settings.supabase_url, settings.supabase_service_role_key)
 
@@ -525,6 +586,41 @@ async def login(db: AsyncSession, email: str, password: str) -> tuple[str, Profi
     if not profile:
         raise InvalidTokenError("Account exists in auth but has no profile")
     return token, profile
+
+
+# FIX M6 — Profile update service (was missing entirely)
+async def update_profile(db: AsyncSession, profile: Profile, data: ProfileUpdateRequest) -> Profile:
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(profile, field, value)
+    await db.commit()
+    await db.refresh(profile)
+    return profile
+
+
+# FIX C3 — Forgot password service (was missing entirely)
+async def forgot_password(email: str) -> None:
+    """Triggers Supabase's built-in password reset email."""
+    try:
+        _supabase.auth.reset_password_email(email)
+    except Exception:
+        # Don't reveal whether the email exists — always return success
+        pass
+
+
+async def reset_password(access_token: str, new_password: str) -> None:
+    """Uses the Supabase admin API to update the user's password."""
+    try:
+        # Verify the token to get the user ID
+        from app.security import verify_supabase_jwt
+        payload = verify_supabase_jwt(access_token)
+        user_id = payload.get("sub")
+        if not user_id:
+            raise InvalidTokenError("Invalid reset token")
+        _supabase.auth.admin.update_user_by_id(user_id, {"password": new_password})
+    except InvalidTokenError:
+        raise
+    except Exception as exc:
+        raise ValidationAppError("Password reset failed") from exc
 ```
 
 **`app/routers/auth.py`**
@@ -536,7 +632,14 @@ from app.core.rate_limit import limiter
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.profile import Profile
-from app.schemas.auth import LoginRequest, SignupRequest, UserResponse
+from app.schemas.auth import (
+    ForgotPasswordRequest,
+    LoginRequest,
+    ProfileUpdateRequest,
+    ResetPasswordRequest,
+    SignupRequest,
+    UserResponse,
+)
 from app.security import clear_auth_cookie, set_auth_cookie, set_csrf_cookie
 from app.services import auth_service
 
@@ -575,6 +678,33 @@ async def me(user: Profile = Depends(get_current_user)):
 async def logout(response: Response):
     clear_auth_cookie(response)
     return {"success": True}
+
+
+# FIX M6 — Profile update endpoint (was missing entirely)
+@router.put("/profile", response_model=UserResponse)
+async def update_profile(
+    data: ProfileUpdateRequest,
+    user: Profile = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await auth_service.update_profile(db, user, data)
+
+
+# FIX C3 — Forgot password endpoint (was missing entirely)
+@router.post("/forgot-password")
+@limiter.limit("3/minute")
+async def forgot_password(request: Request, data: ForgotPasswordRequest):
+    await auth_service.forgot_password(data.email)
+    # Always return success — don't reveal whether the email exists
+    return {"message": "If that email is registered, a reset link has been sent."}
+
+
+# FIX C3 — Reset password endpoint (was missing entirely)
+@router.post("/reset-password")
+@limiter.limit("5/minute")
+async def reset_password(request: Request, data: ResetPasswordRequest):
+    await auth_service.reset_password(data.access_token, data.new_password)
+    return {"success": True}
 ```
 
 > **Why signup and login are separately rate-limited from everything
@@ -585,7 +715,7 @@ async def logout(response: Response):
 
 **Test before continuing** (don't skip this):
 ```bash
-fastapi dev app/main.py   # (write a minimal main.py first — Step 6 below,
+fastapi dev app/main.py   # (write a minimal main.py first — Step 8 below,
                            #  or temporarily include just the auth router)
 curl -c cookies.txt -X POST localhost:8000/auth/signup \
   -H "Content-Type: application/json" \
@@ -655,7 +785,9 @@ class ProductView(Base, UUIDPKMixin):
 
 **`app/schemas/product.py`**
 ```python
-from pydantic import BaseModel
+from datetime import datetime
+
+from pydantic import BaseModel, computed_field
 
 
 class PrintArea(BaseModel):
@@ -734,7 +866,18 @@ class ProductOut(BaseModel):
     customizable: bool
     sizes: list[str]
     colors: list[ProductColorOut]
+    created_at: datetime | None = None      # FIX M5 — was missing
     model_config = {"from_attributes": True}
+
+    # FIX M2 — Frontend references `product.img` for primary image.
+    # This computed field returns the first view's image_url of the first color,
+    # matching the frontend's expectation without changing the DB schema.
+    @computed_field
+    @property
+    def img(self) -> str | None:
+        if self.colors and self.colors[0].views:
+            return self.colors[0].views[0].image_url
+        return None
 
 
 class PaginatedProducts(BaseModel):
@@ -746,6 +889,7 @@ class PaginatedProducts(BaseModel):
 
 **`app/services/product_service.py`**
 ```python
+import re
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -762,6 +906,13 @@ SORT_MAP = {
     "name-az": Product.name.asc(),
     "name-za": Product.name.desc(),
 }
+
+# FIX M9 — Escape special LIKE characters in user-supplied search terms
+_LIKE_ESCAPE_RE = re.compile(r"([%_\\])")
+
+
+def _escape_like(s: str) -> str:
+    return _LIKE_ESCAPE_RE.sub(r"\\\1", s)
 
 
 def _query():
@@ -781,7 +932,9 @@ async def list_products(
         query = query.where(Product.category == category)
         count_query = count_query.where(Product.category == category)
     if search:
-        pattern = f"%{search.lower()}%"
+        # FIX M9 — escape user input for LIKE pattern
+        escaped = _escape_like(search.lower())
+        pattern = f"%{escaped}%"
         query = query.where(func.lower(Product.name).like(pattern))
         count_query = count_query.where(func.lower(Product.name).like(pattern))
     if sort in SORT_MAP:
@@ -920,6 +1073,173 @@ async def delete_product(product_id: UUID, db: AsyncSession = Depends(get_db)):
 
 ---
 
+## Step 4B — Saved Designs (Phase 2.5) *(FIX C1 — was completely missing)*
+
+> This entire step is new. The frontend has `designsApi.js` with full CRUD,
+> and the user confirmed "Option B" (explicit Save Design button). Without
+> this step, the frontend's design save/load/delete endpoints have nothing
+> to talk to.
+
+**`app/models/design.py`**
+```python
+import uuid
+
+from sqlalchemy import ForeignKey, String
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base, TimestampMixin, UUIDPKMixin
+
+
+class SavedDesign(Base, UUIDPKMixin, TimestampMixin):
+    __tablename__ = "saved_designs"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("profiles.id"), index=True)
+    name: Mapped[str] = mapped_column(String)
+    design_json: Mapped[dict] = mapped_column(JSONB)     # serialized design from studioUtils.serializeDesign()
+    product_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("products.id"))
+    color_id: Mapped[str] = mapped_column(String)         # frontend color reference
+    view_id: Mapped[str] = mapped_column(String)           # frontend view reference
+    mockup_url: Mapped[str | None] = mapped_column(String, nullable=True)
+```
+
+**`app/schemas/design.py`**
+```python
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel
+
+
+class DesignCreate(BaseModel):
+    name: str
+    design_json: dict[str, Any]
+    product_id: str
+    color_id: str
+    view_id: str
+    mockup_url: str | None = None
+
+
+class DesignOut(BaseModel):
+    id: str
+    user_id: str
+    name: str
+    design_json: dict[str, Any]
+    product_id: str
+    color_id: str
+    view_id: str
+    mockup_url: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class PaginatedDesigns(BaseModel):
+    items: list[DesignOut]
+    total: int
+    page: int
+    page_size: int
+```
+
+**`app/services/design_service.py`**
+```python
+from uuid import UUID
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.exceptions import ForbiddenError, NotFoundError
+from app.models.design import SavedDesign
+from app.models.profile import Profile
+from app.schemas.design import DesignCreate
+
+
+async def create_design(db: AsyncSession, user: Profile, data: DesignCreate) -> SavedDesign:
+    design = SavedDesign(
+        user_id=user.id, name=data.name, design_json=data.design_json,
+        product_id=UUID(data.product_id), color_id=data.color_id,
+        view_id=data.view_id, mockup_url=data.mockup_url,
+    )
+    db.add(design)
+    await db.commit()
+    await db.refresh(design)
+    return design
+
+
+async def get_designs(
+    db: AsyncSession, user: Profile, page: int, page_size: int
+) -> tuple[list[SavedDesign], int]:
+    query = select(SavedDesign)
+    count_query = select(func.count(SavedDesign.id))
+
+    # Admin sees all designs; regular user sees only their own
+    if user.role not in ("admin", "super_admin"):
+        query = query.where(SavedDesign.user_id == user.id)
+        count_query = count_query.where(SavedDesign.user_id == user.id)
+
+    total = (await db.execute(count_query)).scalar_one()
+    query = query.order_by(SavedDesign.created_at.desc()).limit(page_size).offset((page - 1) * page_size)
+    items = (await db.execute(query)).scalars().all()
+    return list(items), total
+
+
+async def delete_design(db: AsyncSession, user: Profile, design_id: UUID) -> None:
+    design = await db.get(SavedDesign, design_id)
+    if not design:
+        raise NotFoundError("Design not found")
+    if user.role not in ("admin", "super_admin") and design.user_id != user.id:
+        raise ForbiddenError("You can only delete your own designs")
+    await db.delete(design)
+    await db.commit()
+```
+
+**`app/routers/designs.py`**
+```python
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.dependencies import get_current_user
+from app.models.profile import Profile
+from app.schemas.design import DesignCreate, DesignOut, PaginatedDesigns
+from app.services import design_service
+
+router = APIRouter(prefix="/api/designs", tags=["designs"])
+
+
+@router.post("", response_model=DesignOut)
+async def save_design(
+    data: DesignCreate, db: AsyncSession = Depends(get_db),
+    user: Profile = Depends(get_current_user),
+):
+    return await design_service.create_design(db, user, data)
+
+
+@router.get("", response_model=PaginatedDesigns)
+async def list_designs(
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db), user: Profile = Depends(get_current_user),
+):
+    items, total = await design_service.get_designs(db, user, page, page_size)
+    return PaginatedDesigns(
+        items=[DesignOut.model_validate(d) for d in items], total=total, page=page, page_size=page_size,
+    )
+
+
+@router.delete("/{design_id}")
+async def delete_design(
+    design_id: UUID, db: AsyncSession = Depends(get_db),
+    user: Profile = Depends(get_current_user),
+):
+    await design_service.delete_design(db, user, design_id)
+    return {"success": True}
+```
+
+---
+
 ## Step 5 — Orders (Phase 3, the money-handling core)
 
 **`app/models/order.py`**
@@ -936,7 +1256,9 @@ from app.models.base import Base, TimestampMixin, UUIDPKMixin
 class Order(Base, UUIDPKMixin, TimestampMixin):
     __tablename__ = "orders"
 
-    user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("profiles.id"), nullable=True, index=True)
+    # FIX C5 — user_id is now required (NOT nullable).
+    # User confirmed "Option A: Require login before checkout" (Q2).
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("profiles.id"), index=True)
     first_name: Mapped[str] = mapped_column(String)
     last_name: Mapped[str] = mapped_column(String)
     email: Mapped[str] = mapped_column(String)
@@ -974,7 +1296,17 @@ class OrderItem(Base, UUIDPKMixin):
 
 **`app/schemas/order.py`**
 ```python
-from pydantic import BaseModel
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, EmailStr
+
+
+# FIX M7 — Valid order statuses defined as a type
+VALID_STATUSES = Literal["pending", "processing", "shipped", "delivered", "cancelled"]
+
+# FIX m2 — Valid payment methods
+VALID_PAYMENT_METHODS = Literal["cod", "jazzcash", "easypaisa", "stripe"]
 
 
 class OrderItemIn(BaseModel):
@@ -992,13 +1324,13 @@ class OrderItemIn(BaseModel):
 class CreateOrderRequest(BaseModel):
     first_name: str
     last_name: str
-    email: str
+    email: EmailStr                           # FIX m2 — was plain `str`, no validation
     phone: str
     address: str
     city: str
     province: str
     postal_code: str
-    payment_method: str
+    payment_method: VALID_PAYMENT_METHODS     # FIX — constrained to valid values
     wallet_number: str | None = None
     items: list[OrderItemIn]
     # Deliberately no `total` field — the client cannot set price. See
@@ -1022,7 +1354,7 @@ class OrderItemOut(BaseModel):
 
 class OrderOut(BaseModel):
     id: str
-    user_id: str | None
+    user_id: str
     first_name: str
     last_name: str
     email: str
@@ -1036,6 +1368,8 @@ class OrderOut(BaseModel):
     status: str
     total: float
     items: list[OrderItemOut]
+    created_at: datetime | None = None        # FIX M5 — was missing
+    item_count: int | None = None             # FIX M4 — computed field
     model_config = {"from_attributes": True}
 
 
@@ -1047,11 +1381,21 @@ class PaginatedOrders(BaseModel):
 
 
 class UpdateOrderStatus(BaseModel):
-    status: str
+    status: VALID_STATUSES                    # FIX M7 — was plain `str`, accepted anything
+
+
+# FIX C2 — Admin stats response schema (was missing entirely)
+class AdminStatsResponse(BaseModel):
+    total_revenue: float
+    total_orders: int
+    orders_today: int
+    active_products: int
+    total_customers: int
 ```
 
 **`app/services/order_service.py`**
 ```python
+from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -1073,7 +1417,8 @@ STATUS_TRANSITIONS: dict[str, list[str]] = {
 }
 
 
-async def create_order(db: AsyncSession, user: Profile | None, data: CreateOrderRequest) -> Order:
+async def create_order(db: AsyncSession, user: Profile, data: CreateOrderRequest) -> Order:
+    """FIX C5 — `user` is now required (not Optional). Checkout requires auth."""
     if not data.items:
         raise ValidationAppError("Cart is empty")
 
@@ -1104,7 +1449,7 @@ async def create_order(db: AsyncSession, user: Profile | None, data: CreateOrder
         ))
 
     order = Order(
-        user_id=user.id if user else None,
+        user_id=user.id,                      # FIX C5 — always attached to a user now
         first_name=data.first_name, last_name=data.last_name, email=data.email, phone=data.phone,
         address=data.address, city=data.city, province=data.province, postal_code=data.postal_code,
         payment_method=data.payment_method, wallet_number=data.wallet_number,
@@ -1128,7 +1473,7 @@ async def get_orders(
 
     # Enforced, not optional: a non-admin only ever sees their own orders,
     # regardless of what the request tries to ask for.
-    if user.role != "admin":
+    if user.role not in ("admin", "super_admin"):
         query = query.where(Order.user_id == user.id)
         count_query = count_query.where(Order.user_id == user.id)
 
@@ -1147,7 +1492,7 @@ async def get_order_by_id(db: AsyncSession, user: Profile, order_id: UUID) -> Or
     order = result.scalars().unique().one_or_none()
     if not order:
         raise NotFoundError("Order not found")
-    if user.role != "admin" and order.user_id != user.id:
+    if user.role not in ("admin", "super_admin") and order.user_id != user.id:
         raise NotFoundError("Order not found")   # 404, not 403 — don't confirm it exists to a non-owner
     return order
 
@@ -1163,6 +1508,39 @@ async def update_status(db: AsyncSession, order_id: UUID, new_status: str) -> Or
     await db.commit()
     await db.refresh(order)
     return order
+
+
+# FIX C2 — Admin stats service (was missing entirely)
+async def get_admin_stats(db: AsyncSession) -> dict:
+    """Compute real KPI data instead of hardcoded constants."""
+    total_revenue = (await db.execute(
+        select(func.coalesce(func.sum(Order.total), 0))
+    )).scalar_one()
+
+    total_orders = (await db.execute(
+        select(func.count(Order.id))
+    )).scalar_one()
+
+    today = datetime.now(timezone.utc).date()
+    orders_today = (await db.execute(
+        select(func.count(Order.id)).where(func.date(Order.created_at) == today)
+    )).scalar_one()
+
+    active_products = (await db.execute(
+        select(func.count(Product.id))
+    )).scalar_one()
+
+    total_customers = (await db.execute(
+        select(func.count(Profile.id)).where(Profile.role == "customer")
+    )).scalar_one()
+
+    return {
+        "total_revenue": float(total_revenue),
+        "total_orders": total_orders,
+        "orders_today": orders_today,
+        "active_products": active_products,
+        "total_customers": total_customers,
+    }
 ```
 
 **`app/routers/orders.py`**
@@ -1173,9 +1551,15 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_admin, get_current_user, get_current_user_optional
+from app.dependencies import get_current_admin, get_current_user
 from app.models.profile import Profile
-from app.schemas.order import CreateOrderRequest, OrderOut, PaginatedOrders, UpdateOrderStatus
+from app.schemas.order import (
+    AdminStatsResponse,
+    CreateOrderRequest,
+    OrderOut,
+    PaginatedOrders,
+    UpdateOrderStatus,
+)
 from app.services import order_service
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
@@ -1184,9 +1568,13 @@ router = APIRouter(prefix="/api/orders", tags=["orders"])
 @router.post("", response_model=OrderOut)
 async def create_order(
     data: CreateOrderRequest, db: AsyncSession = Depends(get_db),
-    user: Profile | None = Depends(get_current_user_optional),   # guest checkout allowed
+    user: Profile = Depends(get_current_user),       # FIX C5 — was get_current_user_optional
 ):
-    return await order_service.create_order(db, user, data)
+    order = await order_service.create_order(db, user, data)
+    # Attach computed item_count for the response
+    result = OrderOut.model_validate(order)
+    result.item_count = len(order.items)
+    return result
 
 
 @router.get("", response_model=PaginatedOrders)
@@ -1198,6 +1586,13 @@ async def list_orders(
     return PaginatedOrders(
         items=[OrderOut.model_validate(o) for o in items], total=total, page=page, page_size=page_size,
     )
+
+
+@router.get("/stats", response_model=AdminStatsResponse, dependencies=[Depends(get_current_admin)])
+async def admin_stats(db: AsyncSession = Depends(get_db)):
+    """FIX C2 — Admin stats endpoint (was missing entirely).
+    Replaces the hardcoded KPI data in AdminDashboardPage.jsx."""
+    return await order_service.get_admin_stats(db)
 
 
 @router.get("/{order_id}", response_model=OrderOut)
@@ -1242,9 +1637,10 @@ async def upload_file(bucket: str, file_bytes: bytes, content_type: str, extensi
 
 **`app/routers/uploads.py`**
 ```python
-from fastapi import APIRouter, Depends, UploadFile
+from fastapi import APIRouter, Depends, Request, UploadFile
 
-from app.dependencies import get_current_user
+from app.core.rate_limit import limiter
+from app.dependencies import get_current_admin, get_current_user
 from app.services import storage_service
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
@@ -1253,7 +1649,8 @@ EXT_MAP = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
 
 
 @router.post("/image", dependencies=[Depends(get_current_user)])
-async def upload_image(file: UploadFile):
+@limiter.limit("30/minute")                 # FIX m3 — was missing rate limiting
+async def upload_image(request: Request, file: UploadFile):
     content = await file.read()
     url = await storage_service.upload_file(
         "design-uploads", content, file.content_type, EXT_MAP.get(file.content_type, "bin")
@@ -1262,7 +1659,8 @@ async def upload_image(file: UploadFile):
 
 
 @router.post("/design-export", dependencies=[Depends(get_current_user)])
-async def upload_design_export(mockup: UploadFile, print_file: UploadFile):
+@limiter.limit("20/minute")                 # FIX m3 — was missing rate limiting
+async def upload_design_export(request: Request, mockup: UploadFile, print_file: UploadFile):
     mockup_bytes, print_bytes = await mockup.read(), await print_file.read()
     mockup_url = await storage_service.upload_file(
         "design-exports", mockup_bytes, mockup.content_type, EXT_MAP.get(mockup.content_type, "png")
@@ -1271,6 +1669,17 @@ async def upload_design_export(mockup: UploadFile, print_file: UploadFile):
         "design-exports", print_bytes, print_file.content_type, EXT_MAP.get(print_file.content_type, "png")
     )
     return {"mockup_url": mockup_url, "print_url": print_url}
+
+
+# FIX M8 — Product image upload for admin (was missing entirely)
+@router.post("/product-image", dependencies=[Depends(get_current_admin)])
+@limiter.limit("30/minute")
+async def upload_product_image(request: Request, file: UploadFile):
+    content = await file.read()
+    url = await storage_service.upload_file(
+        "product-images", content, file.content_type, EXT_MAP.get(file.content_type, "bin")
+    )
+    return {"url": url}
 ```
 
 Create the three Supabase Storage buckets (`product-images`, `design-uploads`,
@@ -1278,21 +1687,157 @@ Create the three Supabase Storage buckets (`product-images`, `design-uploads`,
 
 ---
 
-## Step 7 — Wire it all together
+## Step 6B — Stripe Payment Stub *(FIX C6 — was missing entirely)*
+
+> This provides the Stripe infrastructure with a feature flag. When
+> `STRIPE_ENABLED=false` (the default), orders go through as COD.
+> When you're ready to launch payments, set `STRIPE_ENABLED=true` and
+> provide a real `STRIPE_SECRET_KEY`.
+
+**`app/services/payment_service.py`**
+```python
+from app.config import settings
+from app.core.exceptions import ValidationAppError
+
+
+async def process_payment(payment_method: str, total: float, wallet_number: str | None) -> dict:
+    """Process payment based on method. Returns payment metadata."""
+
+    if payment_method == "cod":
+        return {"payment_status": "pending_delivery", "provider": "cod"}
+
+    if payment_method == "stripe":
+        if not settings.stripe_enabled:
+            raise ValidationAppError("Online payments are not yet available")
+
+        import stripe
+        stripe.api_key = settings.stripe_secret_key
+
+        # Create a PaymentIntent — the frontend will confirm it with Stripe.js
+        intent = stripe.PaymentIntent.create(
+            amount=int(total * 100),   # Stripe expects amount in smallest currency unit
+            currency="pkr",
+            metadata={"source": "frill_backend"},
+        )
+        return {
+            "payment_status": "requires_confirmation",
+            "provider": "stripe",
+            "client_secret": intent.client_secret,
+        }
+
+    if payment_method in ("jazzcash", "easypaisa"):
+        # Wallet payments — for now, record the wallet number and process manually
+        if not wallet_number:
+            raise ValidationAppError(f"{payment_method} requires a wallet number")
+        return {"payment_status": "pending_verification", "provider": payment_method}
+
+    raise ValidationAppError(f"Unsupported payment method: {payment_method}")
+```
+
+---
+
+## Step 7 — Real-Time Notifications *(FIX C7 — was missing entirely)*
+
+> User confirmed real-time features are in scope (Q16). This provides
+> WebSocket-based order notifications for the admin panel.
+
+**`app/routers/ws.py`**
+```python
+import json
+from typing import ClassVar
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+router = APIRouter(tags=["websocket"])
+
+
+class ConnectionManager:
+    """Simple WebSocket manager for real-time order notifications."""
+
+    active_connections: ClassVar[list[WebSocket]] = []
+
+    @classmethod
+    async def connect(cls, websocket: WebSocket) -> None:
+        await websocket.accept()
+        cls.active_connections.append(websocket)
+
+    @classmethod
+    def disconnect(cls, websocket: WebSocket) -> None:
+        cls.active_connections.remove(websocket)
+
+    @classmethod
+    async def broadcast(cls, message: dict) -> None:
+        """Send a message to all connected clients."""
+        dead: list[WebSocket] = []
+        for connection in cls.active_connections:
+            try:
+                await connection.send_text(json.dumps(message))
+            except Exception:
+                dead.append(connection)
+        for d in dead:
+            cls.active_connections.remove(d)
+
+
+manager = ConnectionManager()
+
+
+@router.websocket("/ws/notifications")
+async def notifications_ws(websocket: WebSocket):
+    """WebSocket endpoint for real-time notifications.
+    Admin panel connects here to receive new order and status update alerts."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive; client can send pings
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+```
+
+> **Usage**: After creating an order or updating status in `order_service`,
+> broadcast a notification:
+> ```python
+> from app.routers.ws import manager
+> await manager.broadcast({"type": "new_order", "order_id": str(order.id)})
+> ```
+
+---
+
+## Step 8 — Wire it all together
 
 **`app/main.py`**
 ```python
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
 from app.core.error_handlers import register_error_handlers
 from app.core.rate_limit import limiter
-from app.routers import auth, orders, products, uploads
+from app.routers import auth, designs, orders, products, uploads, ws
+from app.security import verify_csrf
+
+
+# FIX C4 — CSRF middleware (was defined but never wired)
+class CSRFMiddleware(BaseHTTPMiddleware):
+    """Applies CSRF double-submit check to all state-changing requests.
+    Excludes /auth/signup, /auth/login, /auth/forgot-password, /auth/reset-password
+    because those endpoints don't have a CSRF cookie yet."""
+
+    EXEMPT_PATHS = {
+        "/auth/signup", "/auth/login",
+        "/auth/forgot-password", "/auth/reset-password",
+    }
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            if request.url.path not in self.EXEMPT_PATHS:
+                verify_csrf(request)
+        return await call_next(request)
 
 
 @asynccontextmanager
@@ -1311,14 +1856,21 @@ app.add_middleware(
     allow_credentials=True,   # required for the cookie to be sent cross-origin
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-CSRF-Token"],  # let frontend read CSRF-related headers
 )
+
+# FIX C4 — CSRF middleware MUST be added AFTER CORSMiddleware
+# (middleware stack is LIFO, so CORS runs first on the response)
+app.add_middleware(CSRFMiddleware)
 
 register_error_handlers(app)
 
 app.include_router(auth.router)
 app.include_router(products.router)
+app.include_router(designs.router)        # FIX C1 — was missing
 app.include_router(orders.router)
 app.include_router(uploads.router)
+app.include_router(ws.router)             # FIX C7 — was missing
 
 
 @app.get("/health")
@@ -1328,7 +1880,7 @@ async def health():
 
 ---
 
-## Step 8 — Alembic migrations
+## Step 9 — Alembic migrations
 
 ```bash
 alembic init -t async alembic
@@ -1345,7 +1897,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.config import settings
 from app.models.base import Base
-from app.models import profile, product, order  # noqa: F401 — import so Alembic can see the tables
+from app.models import profile, product, order, design  # noqa: F401 — FIX C1: added design model
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)
@@ -1378,7 +1930,7 @@ alembic upgrade head
 
 ---
 
-## Step 9 — Seed scripts
+## Step 10 — Seed scripts
 
 **`scripts/seed_admin.py`**
 ```python
@@ -1400,9 +1952,10 @@ async def main():
         ))
         result = await db.execute(select(Profile).where(Profile.email == "admin@frill.pk"))
         profile = result.scalar_one()
-        profile.role = "admin"
+        # FIX: per Q3 answer — first admin is super_admin who can manage other admins
+        profile.role = "super_admin"
         await db.commit()
-        print("Admin created:", profile.email, "— change that password immediately.")
+        print("Super admin created:", profile.email, "— change that password immediately.")
 
 
 if __name__ == "__main__":
@@ -1453,7 +2006,7 @@ python scripts/seed_products.py
 
 ---
 
-## Step 10 — Run and verify locally
+## Step 11 — Run and verify locally
 
 ```bash
 fastapi dev app/main.py
@@ -1473,7 +2026,23 @@ for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w "%{http_code}\n" -X POST localh
 
 ---
 
-## Step 11 — Frontend integration (minimal, targeted changes)
+## Step 12 — Frontend integration (minimal, targeted changes)
+
+> **⚠ IMPORTANT: Response shape changes from mock data** *(FIX M1, M2, M3)*
+>
+> The following shapes have changed from what the frontend currently expects.
+> Update your RTK Query endpoints accordingly:
+>
+> | Endpoint | Old shape (mock) | New shape (real API) |
+> |----------|-----------------|---------------------|
+> | `GET /api/products` | `Product[]` | `{ items: Product[], total, page, page_size }` |
+> | `POST /auth/signup` | `{ user, token }` | `UserResponse` (token is in httpOnly cookie, NOT in body) |
+> | `POST /auth/login` | `{ user, token }` | `UserResponse` (token is in httpOnly cookie, NOT in body) |
+> | `Product.desc` | `product.desc` | `product.description` |
+> | `Product.reviews` | `product.reviews` | `product.review_count` |
+> | `Product.img` | `product.img` (primary) | `product.img` (computed from first color/view) |
+> | `Color.id` | `"hoodie-black"` (string) | UUID string |
+> | `View.id` | `"hoodie-black-front"` (string) | UUID string |
 
 **RTK Query base setup** — wherever you currently build your API slice:
 ```javascript
@@ -1496,9 +2065,9 @@ export const baseQuery = fetchBaseQuery({
 })
 ```
 
-Then point `productsApi.js`, `ordersApi.js`, and a new `authApi.js` at this
-`baseQuery` (replacing the `queryFn`-wraps-localStorage pattern), matching
-the endpoint shapes documented in `04_ENDPOINT_REQUIREMENTS.md`.
+Then point `productsApi.js`, `ordersApi.js`, `designsApi.js`, and a new `authApi.js`
+at this `baseQuery` (replacing the `queryFn`-wraps-localStorage pattern), matching
+the endpoint shapes documented above.
 
 **`authSlice.js`** — drop token storage entirely, derive `isAuthenticated`
 from a successful `/auth/me` call:
@@ -1518,26 +2087,51 @@ having to log in again.
 (cookie/CSRF helper file uploads, if you keep those outside RTK Query) — same
 `X-CSRF-Token` header pattern shown above.
 
+**WebSocket connection** *(FIX C7)*:
+```javascript
+// In AdminLayout or admin dashboard
+const ws = new WebSocket(`ws://${window.location.host}/ws/notifications`)
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data)
+  if (data.type === 'new_order') {
+    // Show notification, refetch orders, etc.
+  }
+}
+```
+
 ---
 
 ## Security checklist — confirm every item before calling this "done"
 
 - [ ] Auth cookie is `httponly`, `secure` (prod), `samesite=strict`
-- [ ] CSRF double-submit check wired onto every non-GET route (add
-      `Depends(verify_csrf)` — or a global middleware calling it — to
-      `orders.py`, `products.py` writes, and `uploads.py`)
+- [ ] CSRF double-submit check is wired as global middleware (CSRFMiddleware
+      in `main.py`) — exempts signup/login/forgot-password/reset-password
 - [ ] `/auth/login` and `/auth/signup` are rate-limited
+- [ ] `/auth/forgot-password` and `/auth/reset-password` are rate-limited
+- [ ] Upload endpoints are rate-limited (30/min)
 - [ ] Every admin route depends on `get_current_admin`, not a frontend check
+- [ ] Super admin role exists for admin management (per Q3 answer)
 - [ ] Order total is computed server-side from DB prices, never trusted
       from the client
 - [ ] A customer cannot fetch another customer's order (verified by test,
       not just by reading the code)
+- [ ] Checkout requires authentication (per Q2 answer — Option A)
 - [ ] File uploads reject disallowed content types and oversized files
+- [ ] Product image upload is admin-only
 - [ ] CORS `allow_origins` is your real frontend domain(s) only — never `*`
       once `allow_credentials=True` is set (browsers reject that
       combination anyway, but don't rely on the browser to save you)
 - [ ] No secret (`SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET`,
-      `DATABASE_URL`) is committed to the repo — only in `.env` (gitignored)
-      and Render's environment variable settings
+      `DATABASE_URL`, `STRIPE_SECRET_KEY`) is committed to the repo — only
+      in `.env` (gitignored) and Render's environment variable settings
+- [ ] `.gitignore` is present and covers `.env`, `__pycache__`, `.venv`
 - [ ] `/health` returns 200 with no DB dependency (so Render's health check
       doesn't fail during a slow cold-start DB connection)
+- [ ] Saved designs CRUD is functional and user-scoped
+- [ ] Admin stats endpoint returns real computed data
+- [ ] Password reset flow works end-to-end
+- [ ] Order status is validated as an enum (not arbitrary strings)
+- [ ] Payment method is validated as an enum
+- [ ] LIKE search patterns escape special characters
+- [ ] WebSocket notifications endpoint is accessible
+- [ ] Stripe integration is behind feature flag (disabled by default)
