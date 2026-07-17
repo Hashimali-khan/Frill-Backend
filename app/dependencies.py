@@ -42,5 +42,42 @@ async def get_current_user(request:Request,db:AsyncSession=Depends(get_db)  )->P
     # 4. Return Profile
     return profile
     
+
+async def get_current_user_optional (
+    request:Request,
+    db:AsyncSession=Depends(get_db)
+) ->Profile | None:
+    try:
+        return await get_current_user(request,db)
+    except (InvalidTokenError,ForbiddenError):
+        return None
+
+
+async def get_current_admin(user:Profile=Depends(get_current_user))->Profile:
+    if user.role not in ["admin","super_admin"]:
+        raise ForbiddenError("Admin only")
+    return user
+
+async def get_current_super_admin(user:Profile=Depends(get_current_user))->Profile:
+    if user.role != "super_admin":
+        raise ForbiddenError("Super Admin only")
+    return user
+
+
+class Pagination:
+    def __init__ (
+        self,
+        page: Annotated[int,Query(ge=1)]=1,
+        page_size:Annotated[int,Query(ge=1,le=100)]=20,    
+    ):
+
+        self.page=page
+        self.page_size=page_size
+        self.offset=(page-1)*page_size
+        
+        
+    
+   
+    
     
     
