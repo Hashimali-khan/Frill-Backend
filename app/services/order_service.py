@@ -10,6 +10,7 @@ from app.models.order import Order, OrderItem
 from app.models.product import Product
 from app.models.profile import Profile
 from app.schemas.order import CreateOrderRequest
+from app.services import payment_service
 
 STATUS_TRANSITIONS: dict[str, list[str]] = {
     "pending": ["processing", "cancelled"],
@@ -20,7 +21,7 @@ STATUS_TRANSITIONS: dict[str, list[str]] = {
 }
 
 
-async def create_order(db: AsyncSession, user: Profile, data: CreateOrderRequest) -> Order:
+async def create_order(db: AsyncSession, user: Profile, data: CreateOrderRequest) -> tuple[Order, dict]:
     """FIX C5 — `user` is now required (not Optional). Checkout requires auth."""
     if not data.items:
         raise ValidationAppError("Cart is empty")
@@ -61,7 +62,10 @@ async def create_order(db: AsyncSession, user: Profile, data: CreateOrderRequest
     db.add(order)
     await db.commit()
     await db.refresh(order)
-    return order
+
+    payment_meta = await payment_service.process_payment(data.payment_method, total, data.wallet_number)
+
+    return order, payment_meta
 
 
 def _query():

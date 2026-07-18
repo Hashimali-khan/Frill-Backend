@@ -75,6 +75,12 @@ class OrderOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class CreateOrderResponse(BaseModel):
+    order: OrderOut
+    payment_metadata: dict
+
+
+
 class PaginatedOrders(BaseModel):
     items: list[OrderOut]
     total: int

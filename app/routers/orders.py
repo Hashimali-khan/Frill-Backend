@@ -9,6 +9,7 @@ from app.models.profile import Profile
 from app.schemas.order import (
     AdminStatsResponse,
     CreateOrderRequest,
+    CreateOrderResponse,
     OrderOut,
     PaginatedOrders,
     UpdateOrderStatus,
@@ -18,16 +19,16 @@ from app.services import order_service
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
 
-@router.post("", response_model=OrderOut)
+@router.post("", response_model=CreateOrderResponse)
 async def create_order(
     data: CreateOrderRequest, db: AsyncSession = Depends(get_db),
     user: Profile = Depends(get_current_user),       # FIX C5 — was get_current_user_optional
 ):
-    order = await order_service.create_order(db, user, data)
+    order, payment_meta = await order_service.create_order(db, user, data)
     # Attach computed item_count for the response
     result = OrderOut.model_validate(order)
     result.item_count = len(order.items)
-    return result
+    return CreateOrderResponse(order=result, payment_metadata=payment_meta)
 
 
 @router.get("", response_model=PaginatedOrders)

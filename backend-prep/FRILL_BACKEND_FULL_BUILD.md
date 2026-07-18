@@ -1373,6 +1373,11 @@ class OrderOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class CreateOrderResponse(BaseModel):
+    order: OrderOut
+    payment_metadata: dict
+
+
 class PaginatedOrders(BaseModel):
     items: list[OrderOut]
     total: int
@@ -1407,6 +1412,7 @@ from app.models.order import Order, OrderItem
 from app.models.product import Product
 from app.models.profile import Profile
 from app.schemas.order import CreateOrderRequest
+from app.services import payment_service
 
 STATUS_TRANSITIONS: dict[str, list[str]] = {
     "pending": ["processing", "cancelled"],
@@ -1417,7 +1423,7 @@ STATUS_TRANSITIONS: dict[str, list[str]] = {
 }
 
 
-async def create_order(db: AsyncSession, user: Profile, data: CreateOrderRequest) -> Order:
+async def create_order(db: AsyncSession, user: Profile, data: CreateOrderRequest) -> tuple[Order, dict]:
     """FIX C5 — `user` is now required (not Optional). Checkout requires auth."""
     if not data.items:
         raise ValidationAppError("Cart is empty")
@@ -1458,7 +1464,10 @@ async def create_order(db: AsyncSession, user: Profile, data: CreateOrderRequest
     db.add(order)
     await db.commit()
     await db.refresh(order)
-    return order
+
+    payment_meta = await payment_service.process_payment(data.payment_method, total, data.wallet_number)
+
+    return order, payment_meta
 
 
 def _query():
@@ -1556,6 +1565,7 @@ from app.models.profile import Profile
 from app.schemas.order import (
     AdminStatsResponse,
     CreateOrderRequest,
+    CreateOrderResponse,
     OrderOut,
     PaginatedOrders,
     UpdateOrderStatus,
@@ -1565,16 +1575,16 @@ from app.services import order_service
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
 
-@router.post("", response_model=OrderOut)
+@router.post("", response_model=CreateOrderResponse)
 async def create_order(
     data: CreateOrderRequest, db: AsyncSession = Depends(get_db),
     user: Profile = Depends(get_current_user),       # FIX C5 — was get_current_user_optional
 ):
-    order = await order_service.create_order(db, user, data)
+    order, payment_meta = await order_service.create_order(db, user, data)
     # Attach computed item_count for the response
     result = OrderOut.model_validate(order)
     result.item_count = len(order.items)
-    return result
+    return CreateOrderResponse(order=result, payment_metadata=payment_meta)
 
 
 @router.get("", response_model=PaginatedOrders)
