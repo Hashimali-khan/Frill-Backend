@@ -9,6 +9,7 @@ from app.core.exceptions import NotFoundError, ValidationAppError
 from app.models.order import Order, OrderItem
 from app.models.product import Product
 from app.models.profile import Profile
+from app.routers.ws import manager
 from app.schemas.order import CreateOrderRequest
 from app.services import payment_service
 
@@ -63,6 +64,8 @@ async def create_order(db: AsyncSession, user: Profile, data: CreateOrderRequest
     await db.commit()
     await db.refresh(order)
 
+    await manager.broadcast({"type": "new_order", "order_id": str(order.id)})
+
     payment_meta = await payment_service.process_payment(data.payment_method, total, data.wallet_number)
 
     return order, payment_meta
@@ -114,6 +117,7 @@ async def update_status(db: AsyncSession, order_id: UUID, new_status: str) -> Or
     order.status = new_status
     await db.commit()
     await db.refresh(order)
+    await manager.broadcast({"type": "status_update", "order_id": str(order.id), "status": new_status})
     return order
 
 
