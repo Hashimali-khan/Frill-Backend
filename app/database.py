@@ -13,7 +13,7 @@ engine = create_async_engine(
     db_url,
     pool_pre_ping=True,          # detects a dropped connection before using it
     echo=not settings.is_production,
-    connect_args={"prepared_statement_cache_size": 0},
+    connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0},
 )
 
 AsyncSessionLocal = async_sessionmaker(
