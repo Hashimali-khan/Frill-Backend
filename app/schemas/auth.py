@@ -1,5 +1,7 @@
 import re
 
+from uuid import UUID
+
 from pydantic import BaseModel,field_validator, EmailStr
 
 PK_PHONE_RE = re.compile(r"^(0|\+92)3[0-9]{9}$")
@@ -41,7 +43,7 @@ class LoginRequest(BaseModel):
 
 class UserResponse(BaseModel):
 
-    id: str
+    id: UUID
     first_name: str
     last_name: str
     email: str

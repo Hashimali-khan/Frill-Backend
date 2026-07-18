@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -14,13 +15,13 @@ class DesignCreate(BaseModel):
 
 
 class DesignOut(BaseModel):
-    id: str
-    user_id: str
+    id: UUID
+    user_id: UUID
     name: str
     design_json: dict[str, Any]
-    product_id: str
-    color_id: str
-    view_id: str
+    product_id: UUID
+    color_id: UUID
+    view_id: UUID
     mockup_url: str | None
     created_at: datetime
     updated_at: datetime

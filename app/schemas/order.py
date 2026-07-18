@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, EmailStr
 
@@ -40,8 +41,8 @@ class CreateOrderRequest(BaseModel):
 
 
 class OrderItemOut(BaseModel):
-    id: str
-    product_id: str | None
+    id: UUID
+    product_id: UUID | None
     product_name_snapshot: str
     price_snapshot: float
     quantity: int
@@ -55,8 +56,8 @@ class OrderItemOut(BaseModel):
 
 
 class OrderOut(BaseModel):
-    id: str
-    user_id: str
+    id: UUID
+    user_id: UUID
     first_name: str
     last_name: str
     email: str

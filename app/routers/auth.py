@@ -32,7 +32,7 @@ async def signup(
 
 
 @router.post("/login", response_model=UserResponse)
-@limiter.limit("10/minute")
+@limiter.limit("5/minute")
 async def login(
     request: Request, data: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)
 ):

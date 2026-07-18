@@ -27,7 +27,7 @@ def _escape_like(s: str) -> str:
 
 def _query():
     return select(Product).options(
-        selectinload(Product.colors).selectinload(Product.views)
+        selectinload(Product.colors).selectinload(ProductColor.views)
     )
 
 

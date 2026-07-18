@@ -25,9 +25,14 @@ async def get_current_user(request:Request,db:AsyncSession=Depends(get_db)  )->P
     if not token:
         raise InvalidTokenError("No token found")
 
-    # 2. Verify JWT
-    payload=verify_supabase_jwt(token)
-    user_id=payload.get("sub")
+    # 2. Verify JWT via Supabase API
+    import asyncio
+    from app.services.auth_service import _supabase
+    try:
+        res = await asyncio.to_thread(_supabase.auth.get_user, token)
+        user_id = res.user.id
+    except Exception as exc:
+        raise InvalidTokenError("Invalid token") from exc
     
     if not user_id:
         raise InvalidTokenError("No user ID found")

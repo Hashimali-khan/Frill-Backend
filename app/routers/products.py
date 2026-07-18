@@ -56,7 +56,7 @@ async def create_product(data: ProductCreate, db: AsyncSession = Depends(get_db)
     await cache_delete_prefix("products:list:")   # stale cache would hide the new product
     return product
 
-response_model=ProductOut, dependencies=[Depends(get_current_admin)])
+@router.patch("/{product_id}", response_model=ProductOut, dependencies=[Depends(get_current_admin)])
 async def update_product(product_id: UUID, data: ProductUpdate, db: AsyncSession = Depends(get_db)):
     product = await product_service.update_product(db, product_id, data)
     await cache_delete_prefix("products:list:")

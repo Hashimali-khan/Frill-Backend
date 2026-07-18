@@ -1,5 +1,6 @@
 from sqlalchemy import label
 from datetime import datetime
+from uuid import UUID
 
 from pydantic import BaseModel, computed_field
 
@@ -19,7 +20,7 @@ class ProductViewIn(BaseModel):
 
 
 class ProductViewOut(ProductViewIn):
-    id: str
+    id: UUID
     model_config = {"from_attributes": True}
 
 
@@ -30,7 +31,7 @@ class ProductColorIn(BaseModel):
 
 
 class ProductColorOut(BaseModel):
-    id: str
+    id: UUID
     name: str
     hex: str
     views: list[ProductViewOut]
@@ -65,7 +66,7 @@ class ProductUpdate(BaseModel):
 
 
 class ProductOut(BaseModel):
-    id: str
+    id: UUID
     slug: str
     name: str
     vendor: str
