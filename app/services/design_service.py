@@ -46,3 +46,12 @@ async def delete_design(db: AsyncSession, user: Profile, design_id: UUID) -> Non
         raise ForbiddenError("You can only delete your own designs")
     await db.delete(design)
     await db.commit()
+
+async def update_status(db: AsyncSession, design_id: UUID, new_status: str) -> SavedDesign:
+    design = await db.get(SavedDesign, design_id)
+    if not design:
+        raise NotFoundError("Design not found")
+    design.status = new_status
+    await db.commit()
+    await db.refresh(design)
+    return design

@@ -1,7 +1,7 @@
 import uuid
 
-from sqlalchemy import ForeignKey, Integer, Numeric, String
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import ForeignKey, Integer, Numeric, String, JSON
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPKMixin
@@ -25,7 +25,7 @@ class Order(Base, UUIDPKMixin, TimestampMixin):
     status: Mapped[str] = mapped_column(String, default="pending", index=True)
     total: Mapped[float] = mapped_column(Numeric(10, 2))
 
-    items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
+    items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan", lazy="selectin")
 
 
 class OrderItem(Base, UUIDPKMixin):
@@ -42,6 +42,6 @@ class OrderItem(Base, UUIDPKMixin):
     selected_view_label: Mapped[str | None] = mapped_column(String, nullable=True)
     mockup_url: Mapped[str | None] = mapped_column(String, nullable=True)
     print_url: Mapped[str | None] = mapped_column(String, nullable=True)
-    design_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    design_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     order: Mapped["Order"] = relationship(back_populates="items")

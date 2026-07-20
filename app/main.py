@@ -41,6 +41,11 @@ app = FastAPI(title="Frill API", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# FIX C4 — CSRF middleware MUST be added BEFORE CORSMiddleware in the code
+# (add_middleware is LIFO, so the last added middleware executes first on the request.
+# We want CORSMiddleware to execute first, so it must be added LAST).
+app.add_middleware(CSRFMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
@@ -49,10 +54,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-CSRF-Token"],  # let frontend read CSRF-related headers
 )
-
-# FIX C4 — CSRF middleware MUST be added AFTER CORSMiddleware
-# (middleware stack is LIFO, so CORS runs first on the response)
-app.add_middleware(CSRFMiddleware)
 
 register_error_handlers(app)
 

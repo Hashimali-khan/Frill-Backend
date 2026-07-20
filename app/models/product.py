@@ -1,7 +1,7 @@
 import uuid
 
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, Numeric, String
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import Boolean, Float, ForeignKey, Integer, Numeric, String, JSON
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPKMixin
@@ -21,10 +21,10 @@ class Product(Base, UUIDPKMixin, TimestampMixin):
     stars: Mapped[float] = mapped_column(Float, default=0)
     review_count: Mapped[int] = mapped_column(Integer, default=0)
     customizable: Mapped[bool] = mapped_column(Boolean, default=False)
-    sizes: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    sizes: Mapped[list[str]] = mapped_column(JSON, default=list)
 
     colors: Mapped[list["ProductColor"]] = relationship(
-        back_populates="product", cascade="all, delete-orphan"
+        back_populates="product", cascade="all, delete-orphan", lazy="selectin"
     )
 
 class ProductColor(Base, UUIDPKMixin):
@@ -36,7 +36,7 @@ class ProductColor(Base, UUIDPKMixin):
 
     product: Mapped["Product"] = relationship(back_populates="colors")
     views: Mapped[list["ProductView"]] = relationship(
-        back_populates="color", cascade="all, delete-orphan"
+        back_populates="color", cascade="all, delete-orphan", lazy="selectin"
     )
 
 
@@ -46,6 +46,6 @@ class ProductView(Base, UUIDPKMixin):
     color_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("product_colors.id"))
     label: Mapped[str] = mapped_column(String)
     image_url: Mapped[str] = mapped_column(String)
-    print_area: Mapped[dict] = mapped_column(JSONB)   # {x, y, width, height} — always read/written as one unit
+    print_area: Mapped[dict] = mapped_column(JSON)   # {x, y, width, height} — always read/written as one unit
 
     color: Mapped["ProductColor"] = relationship(back_populates="views")

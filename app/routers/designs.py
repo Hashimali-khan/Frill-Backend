@@ -38,3 +38,12 @@ async def delete_design(
 ):
     await design_service.delete_design(db, user, design_id)
     return {"success": True}
+
+from app.dependencies import get_current_admin
+from app.schemas.design import DesignStatusUpdate
+
+@router.patch("/{design_id}/status", response_model=DesignOut, dependencies=[Depends(get_current_admin)])
+async def update_design_status(
+    design_id: UUID, data: DesignStatusUpdate, db: AsyncSession = Depends(get_db)
+):
+    return await design_service.update_status(db, design_id, data.status)

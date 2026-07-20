@@ -26,8 +26,9 @@ async def signup(db:AsyncSession, data:SignupRequest)->Profile:
 
     user_id= auth_response.user.id
 
+    import uuid
     profile= Profile(
-        id=user_id, email=data.email, first_name=data.first_name,
+        id=uuid.UUID(user_id), email=data.email, first_name=data.first_name,
         last_name=data.last_name, phone=data.phone, role="customer",
     )
 

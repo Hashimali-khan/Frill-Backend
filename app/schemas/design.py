@@ -20,13 +20,17 @@ class DesignOut(BaseModel):
     name: str
     design_json: dict[str, Any]
     product_id: UUID
-    color_id: UUID
-    view_id: UUID
+    color_id: str
+    view_id: str
     mockup_url: str | None
+    status: str
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+class DesignStatusUpdate(BaseModel):
+    status: str
 
 
 class PaginatedDesigns(BaseModel):
